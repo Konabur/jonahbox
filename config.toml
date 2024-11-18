@@ -1,5 +1,5 @@
 # The host which your Jackbox games can access (through HTTPS)
-accessible_host = "192.168.1.10"
+accessible_host = "jackbox.nations.lol"
 # Whether the TUI should be ran when running this server, set
 # to false if this server is to be run as a daemon (we also
 # check if stdout is a TTY or not as well, so you can leave
@@ -47,11 +47,11 @@ tts_dir = "tts"
 #
 # Generate TTS using `piper`
 #
-op_mode = "native"
+# op_mode = "native"
 #
 # Ask `blobcast.server_url` to generate the TTS audio
 #
-# op_mode = "proxy"
+op_mode = "proxy"
 
 [ecast]
 # Any connections that go through in proxy mode will be proxied to the `server_url`
@@ -83,6 +83,6 @@ key = "certs/192.168.1.10-key.pem"
 
 # These defaults are the ports that the Jackbox games will try to connect to
 [ports]
-https = 443
+https = 4343
 blobcast = 38203
-http = 80
+http = 8080

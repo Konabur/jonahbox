@@ -189,7 +189,7 @@ struct TTSConfig {
 struct Ports {
     https: u16,
     blobcast: u16,
-    http: Option<u16>,
+    http: u16,
 }
 
 #[derive(Deserialize)]
@@ -519,14 +519,19 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("Ecast listening on {}", addr);
     let blobcast_addr = SocketAddr::from(([0, 0, 0, 0], ports.blobcast));
     tracing::info!("Blobcast listening on {}", blobcast_addr);
+    let http_addr = SocketAddr::from(([0, 0, 0, 0], ports.http));
+    tracing::info!("Ecast (insecure) listening on {}", http_addr);
     tokio::try_join!(
         axum_server::bind_rustls(addr, tls_config.clone())
             .handle(handle.clone())
             .serve(app.clone().into_make_service()),
         axum_server::bind_rustls(blobcast_addr, tls_config)
             .handle(handle.clone())
+            .serve(app.clone().into_make_service()),
+        axum_server::bind(http_addr)
+            .handle(handle)
             .serve(app.into_make_service()),
-        redirect_http_to_https(ports, handle.clone()),
+        // redirect_http_to_https(ports, handle.clone()),
         tui_future,
     )?;
 
@@ -606,47 +611,38 @@ async fn redirect_http_to_https(
     ports: Ports,
     handle: axum_server::Handle,
 ) -> Result<(), std::io::Error> {
-    if let Some(port) = ports.http {
-        fn make_https(
-            host: String,
-            uri: Uri,
-            http: String,
-            https: String,
-        ) -> Result<Uri, BoxError> {
-            tracing::debug!(host, ?uri, http, https, "Received HTTP request");
-            let mut parts = uri.into_parts();
+    fn make_https(host: String, uri: Uri, http: String, https: String) -> Result<Uri, BoxError> {
+        tracing::debug!(host, ?uri, http, https, "Received HTTP request");
+        let mut parts = uri.into_parts();
 
-            parts.scheme = Some(axum::http::uri::Scheme::HTTPS);
+        parts.scheme = Some(axum::http::uri::Scheme::HTTPS);
 
-            if parts.path_and_query.is_none() {
-                parts.path_and_query = Some("/".parse().unwrap());
-            }
-
-            let https_host = host.replace(&http, &https);
-            parts.authority = Some(https_host.parse()?);
-
-            Ok(Uri::from_parts(parts)?)
+        if parts.path_and_query.is_none() {
+            parts.path_and_query = Some("/".parse().unwrap());
         }
 
-        let http = format!("{}", port);
-        let https = format!("{}", ports.https);
-        let redirect = move |Host(host): Host, uri: Uri| async move {
-            match make_https(host, uri, http, https) {
-                Ok(uri) => Ok(Redirect::permanent(&uri.to_string())),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to convert URI to HTTPS");
-                    Err(StatusCode::BAD_REQUEST)
-                }
-            }
-        };
+        let https_host = host.replace(&http, &https);
+        parts.authority = Some(https_host.parse()?);
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], 80));
-        tracing::info!("listening on {}", addr);
-        axum_server::bind(addr)
-            .handle(handle)
-            .serve(redirect.into_make_service())
-            .await
-    } else {
-        Ok(())
+        Ok(Uri::from_parts(parts)?)
     }
+
+    let http = format!("{}", ports.http);
+    let https = format!("{}", ports.https);
+    let redirect = move |Host(host): Host, uri: Uri| async move {
+        match make_https(host, uri, http, https) {
+            Ok(uri) => Ok(Redirect::permanent(&uri.to_string())),
+            Err(error) => {
+                tracing::warn!(%error, "failed to convert URI to HTTPS");
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
+    };
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 80));
+    tracing::info!("listening on {}", addr);
+    axum_server::bind(addr)
+        .handle(handle)
+        .serve(redirect.into_make_service())
+        .await
 }
