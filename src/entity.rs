@@ -14,7 +14,7 @@ use ringbuf::{traits::Consumer, Cons};
 use serde::{de::Error, ser::SerializeSeq, Deserialize, Serialize, Serializer};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tokio::io::Interest;
-use yrs::{sync::Awareness, ReadTxn, StateVector, Transact};
+use yrs::{sync::Awareness, ReadTxn, Snapshot, StateVector, Transact};
 
 use crate::{acl::Role, ecast::ws::JBResult};
 
@@ -133,6 +133,8 @@ pub enum JBPlayerValue {
         val: JBDoodle,
     },
     TextMap {
+        #[serde(skip)]
+        initial_snapshot: Snapshot,
         #[serde(serialize_with = "serialize_root")]
         root: Awareness,
     },

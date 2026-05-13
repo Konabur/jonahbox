@@ -16,7 +16,7 @@ use crate::{
     Client, ClientType, ConnectedSocket, JBProfile, Room, Token,
 };
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use color_eyre::eyre::{self, bail, eyre, OptionExt, WrapErr};
 use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
@@ -265,7 +265,7 @@ pub async fn connect_socket(
     let (mut ws_write, mut ws_read) = socket.split();
 
     ws_write
-        .send(Message::Text("1::".to_owned()))
+        .send(Message::Text(Utf8Bytes::from_static("1::")))
         .await
         .wrap_err("Failed to send blobcast connection message: 1::")?;
 
@@ -407,7 +407,7 @@ pub async fn handle_socket(
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                client.send_ws_message(Message::Text(String::from("2:::"))).await
+                client.send_ws_message(Message::Text(Utf8Bytes::from_static("2:::"))).await
                     .wrap_err("Failed to send blobcast ping to client")?;
             }
             _ = room.exit.notified() => {
@@ -893,7 +893,7 @@ pub async fn handle_socket_proxy(
                             },
                             "to blobcast",
                         );
-                        return Ok(tokio_tungstenite::tungstenite::Message::Text(m));
+                        return Ok(tokio_tungstenite::tungstenite::Message::Text(m.to_string().into()));
                     }
                     axum::extract::ws::Message::Binary(m) => {
                         Ok(tokio_tungstenite::tungstenite::Message::Binary(m))
@@ -908,7 +908,7 @@ pub async fn handle_socket_proxy(
                         Ok(tokio_tungstenite::tungstenite::Message::Close(m.map(|f| {
                             tokio_tungstenite::tungstenite::protocol::CloseFrame {
                                 code: f.code.into(),
-                                reason: f.reason,
+                                reason: f.reason.to_string().into(),
                             }
                         })))
                     }
@@ -963,7 +963,7 @@ pub async fn handle_socket_proxy(
                         },
                         "blobcast to",
                     );
-                    return Ok(axum::extract::ws::Message::Text(m));
+                    return Ok(axum::extract::ws::Message::Text(m.to_string().into()));
                 }
                 tokio_tungstenite::tungstenite::Message::Binary(m) => {
                     Ok(axum::extract::ws::Message::Binary(m))
@@ -978,7 +978,7 @@ pub async fn handle_socket_proxy(
                     Ok(axum::extract::ws::Message::Close(m.map(|f| {
                         axum::extract::ws::CloseFrame {
                             code: f.code.into(),
-                            reason: f.reason,
+                            reason: f.reason.to_string().into(),
                         }
                     })))
                 }

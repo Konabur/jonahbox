@@ -1,3 +1,4 @@
+use axum_server::Address;
 use ratatui::{
     style::{Modifier, Style, Stylize},
     widgets::{Block, Borders, List, Paragraph, StatefulWidget, Widget, Wrap},
@@ -5,9 +6,9 @@ use ratatui::{
 
 use super::AppFocus;
 
-pub struct RoomsList<'a>(pub &'a mut super::TuiState);
+pub struct RoomsList<'a, A: Address>(pub &'a mut super::TuiState<A>);
 
-impl<'a> Widget for RoomsList<'a> {
+impl<'a, A: Address> Widget for RoomsList<'a, A> {
     fn render(self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer)
     where
         Self: Sized,

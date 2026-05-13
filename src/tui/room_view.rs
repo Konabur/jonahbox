@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use axum_server::Address;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style, Stylize},
@@ -8,9 +9,9 @@ use ratatui::{
 
 use super::{AppFocus, RoomTabs};
 
-pub struct RoomView<'a>(pub &'a mut super::TuiState);
+pub struct RoomView<'a, A: Address>(pub &'a mut super::TuiState<A>);
 
-impl<'a> Widget for RoomView<'a> {
+impl<'a, A: Address> Widget for RoomView<'a, A> {
     fn render(self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer)
     where
         Self: Sized,

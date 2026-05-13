@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     fmt::{Debug, Display, LowerHex},
     io::stdout,
-    net::SocketAddr,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     ops::DerefMut,
     path::PathBuf,
     sync::{
@@ -13,15 +13,15 @@ use std::{
 };
 
 use axum::{
+    body::Bytes,
     extract::{
-        ws::{Message, WebSocket},
-        Host, OriginalUri,
+        ws::{Message, Utf8Bytes, WebSocket},
+        OriginalUri,
     },
-    handler::HandlerWithoutStateExt,
     http::{uri::PathAndQuery, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
-    BoxError, Json, Router,
+    Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use color_eyre::eyre::{self, Context};
@@ -32,9 +32,9 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt,
 };
-use helix_stdx::rope::RegexBuilder;
 use rand::{rngs::OsRng, RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro128PlusPlus;
+use regex::RegexBuilder;
 use reqwest::header::USER_AGENT;
 use serde::{de::Error, Deserialize, Serialize};
 use serde_json::json;
@@ -43,7 +43,6 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::instrument;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use tree_sitter::{Parser, QueryCursor};
 
 mod acl;
 mod blobcast;
@@ -293,7 +292,10 @@ impl Client {
         let json_message = serde_json::to_string(&message)
             .wrap_err_with(|| format!("Failed to serialize ecast message: {:?}", &message))?;
         tracing::trace!(%json_message, "Ecast Message");
-        if let Err(e) = self.send_ws_message(Message::Text(json_message)).await {
+        if let Err(e) = self
+            .send_ws_message(Message::Text(json_message.into()))
+            .await
+        {
             self.disconnect().await;
             return Err(e)
                 .wrap_err_with(|| format!("Ecast message failed to send: {:?}", &message));
@@ -309,7 +311,7 @@ impl Client {
             .wrap_err_with(|| format!("Failed to serialize blobcast message: {:?}", &message))?;
         tracing::trace!(%message, "Blobcast Message");
         if let Err(e) = self
-            .send_ws_message(Message::Text(format!("5:::{}", message)))
+            .send_ws_message(Message::Text(format!("5:::{}", message).into()))
             .await
         {
             self.disconnect().await;
@@ -320,7 +322,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn ping(&self, d: Vec<u8>) -> eyre::Result<()> {
+    pub async fn ping(&self, d: Bytes) -> eyre::Result<()> {
         if let Err(e) = self.send_ws_message(Message::Ping(d)).await {
             self.disconnect().await;
             return Err(e).wrap_err("Failed to ping socket");
@@ -329,7 +331,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn pong(&self, d: Vec<u8>) -> eyre::Result<()> {
+    pub async fn pong(&self, d: Bytes) -> eyre::Result<()> {
         if let Err(e) = self.send_ws_message(Message::Pong(d)).await {
             self.disconnect().await;
             return Err(e).wrap_err("Failed to pong socket");
@@ -343,7 +345,7 @@ impl Client {
 
         self.send_ws_message(Message::Close(Some(axum::extract::ws::CloseFrame {
             code: 1000,
-            reason: Cow::Borrowed("normal close"),
+            reason: Utf8Bytes::from_static("normal close"),
         })))
         .await
         .wrap_err("Failed to close connection")?;
@@ -414,17 +416,11 @@ async fn main() -> eyre::Result<()> {
         .await
         .wrap_err_with(|| format!("TLS Config failed: {:?}", config.tls))?;
 
-    let fragment_regex = RegexBuilder::new()
-        .build("blobcast.jackboxgames.com|ecast.jackboxgames.com|bundles.jackbox.tv|jackbox.tv|cdn.jackboxgames.com|s3.amazonaws.com")
+    let fragment_regex = RegexBuilder::new("blobcast.jackboxgames.com|ecast.jackboxgames.com|bundles.jackbox.tv|uuid.jackbox.tv|jackbox.tv|cdn.jackboxgames.com|s3.amazonaws.com")
+        .build()
         .wrap_err("fragment_regex failed to build")?;
-    let content_to_compress = RegexBuilder::new().build("text/html|text/css|text/xml|text/javascript|application/javascript|application/x-javascript|application/json").wrap_err("content_to_compress regex failed to build")?;
+    let content_to_compress = RegexBuilder::new("text/html|text/css|text/xml|text/javascript|application/javascript|application/x-javascript|application/json").build().wrap_err("content_to_compress regex failed to build")?;
 
-    let js_lang = tree_sitter_javascript::language();
-    let fragment_query = tree_sitter::Query::new(&js_lang, "(string_fragment) @frag")
-        .wrap_err("fragment_query failed to build")?;
-    let css_lang = tree_sitter_css::language();
-    let css_query = tree_sitter::Query::new(&css_lang, "(plain_value) @frag")
-        .wrap_err("css_query failed to build")?;
     let (tx, rx) = tokio::sync::watch::channel(());
     let state = State {
         tui_sender: tx.clone(),
@@ -432,9 +428,6 @@ async fn main() -> eyre::Result<()> {
         room_map: Arc::new(DashMap::new()),
         http_cache: http_cache::HttpCache {
             client: reqwest::Client::new(),
-            ts_parser: Arc::new(Mutex::new((Parser::new(), QueryCursor::new()))),
-            js_lang: Arc::new((js_lang, fragment_query)),
-            css_lang: Arc::new((css_lang, css_query)),
             regexes: Arc::new(http_cache::Regexes {
                 content_to_compress,
                 jackbox_urls: fragment_regex,
@@ -491,35 +484,40 @@ async fn main() -> eyre::Result<()> {
     let ports = state.config.ports;
 
     let app = Router::new()
-        .route("/api/v2/rooms/:code/play", get(ecast::play_handler))
-        .route("/api/v2/audience/:code/play", get(ecast::play_handler))
+        .route("/api/v2/rooms/{code}/play", get(ecast::play_handler))
+        .route("/api/v2/audience/{code}/play", get(ecast::play_handler))
         .route("/api/v2/rooms", post(ecast::rooms_handler))
         .route(
-            "/@ecast.jackboxgames.com/api/v2/rooms/:code",
+            "/@ecast.jackboxgames.com/api/v2/rooms/{code}",
             get(ecast::rooms_get_handler),
         )
         .route(
-            "/api/v2/app-configs/:app_tag",
+            "/api/v2/app-configs/{app_tag}",
             get(ecast::app_config_handler),
         )
         .route("/tts/generate", post(tts::generate_handler))
         .route_service(
-            "/tts/*path",
+            "/tts/{*path}",
             ServeDir::new(state.config.tts.tts_dir.clone()),
         )
         .route("/room", get(blobcast::rooms_handler))
         .route("/accessToken", post(blobcast::access_token_handler))
         .route("/socket.io/1", get(blobcast::load_handler))
-        .route("/socket.io/1/websocket/:id", get(blobcast::play_handler))
+        .route("/socket.io/1/websocket/{id}", get(blobcast::play_handler))
         .fallback(serve_jb_tv)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], ports.https));
+    let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, ports.https, 0, 0));
     tracing::info!("Ecast listening on {}", addr);
-    let blobcast_addr = SocketAddr::from(([0, 0, 0, 0], ports.blobcast));
+    let blobcast_addr = SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::UNSPECIFIED,
+        ports.blobcast,
+        0,
+        0,
+    ));
     tracing::info!("Blobcast listening on {}", blobcast_addr);
-    let http_addr = SocketAddr::from(([0, 0, 0, 0], ports.http));
+    let http_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, ports.http, 0, 0));
     tracing::info!("Ecast (insecure) listening on {}", http_addr);
     tokio::try_join!(
         axum_server::bind_rustls(addr, tls_config.clone())
@@ -531,7 +529,6 @@ async fn main() -> eyre::Result<()> {
         axum_server::bind(http_addr)
             .handle(handle)
             .serve(app.into_make_service()),
-        // redirect_http_to_https(ports, handle.clone()),
         tui_future,
     )?;
 
@@ -605,44 +602,4 @@ pub fn room_id() -> String {
     let mut code = nanoid::nanoid!(4, &ALPHA_CAPITAL, random);
     code.make_ascii_uppercase();
     code
-}
-
-async fn redirect_http_to_https(
-    ports: Ports,
-    handle: axum_server::Handle,
-) -> Result<(), std::io::Error> {
-    fn make_https(host: String, uri: Uri, http: String, https: String) -> Result<Uri, BoxError> {
-        tracing::debug!(host, ?uri, http, https, "Received HTTP request");
-        let mut parts = uri.into_parts();
-
-        parts.scheme = Some(axum::http::uri::Scheme::HTTPS);
-
-        if parts.path_and_query.is_none() {
-            parts.path_and_query = Some("/".parse().unwrap());
-        }
-
-        let https_host = host.replace(&http, &https);
-        parts.authority = Some(https_host.parse()?);
-
-        Ok(Uri::from_parts(parts)?)
-    }
-
-    let http = format!("{}", ports.http);
-    let https = format!("{}", ports.https);
-    let redirect = move |Host(host): Host, uri: Uri| async move {
-        match make_https(host, uri, http, https) {
-            Ok(uri) => Ok(Redirect::permanent(&uri.to_string())),
-            Err(error) => {
-                tracing::warn!(%error, "failed to convert URI to HTTPS");
-                Err(StatusCode::BAD_REQUEST)
-            }
-        }
-    };
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], 80));
-    tracing::info!("listening on {}", addr);
-    axum_server::bind(addr)
-        .handle(handle)
-        .serve(redirect.into_make_service())
-        .await
 }

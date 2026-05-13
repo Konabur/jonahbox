@@ -7,9 +7,12 @@ use std::{
     time::Duration,
 };
 
-use axum::extract::{
-    ws::{Message, WebSocket},
-    Query,
+use axum::{
+    body::Bytes,
+    extract::{
+        ws::{Message, WebSocket},
+        Query,
+    },
 };
 use base64::Engine;
 use color_eyre::eyre::{self, bail, eyre, Context, OptionExt};
@@ -24,7 +27,7 @@ use yrs::{
     sync::{Awareness, MessageReader, SyncMessage},
     types::text::YChange,
     updates::decoder::{Decode, DecoderV1},
-    Doc, GetString, ReadTxn, Snapshot, Text, TextPrelim, Transact, Update, WriteTxn,
+    Doc, GetString, ReadTxn, Text, TextPrelim, Transact, Update, WriteTxn,
 };
 
 use crate::{
@@ -271,6 +274,7 @@ impl JBParams {
 
 #[derive(Deserialize, Debug)]
 struct JBCreateParams {
+    #[serde(alias = "name")]
     key: String,
     #[serde(default = "Acl::default_vec")]
     acl: Vec<Acl>,
@@ -575,7 +579,7 @@ pub async fn handle_socket(
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                client.ping(b"jackbox".to_vec()).await?;
+                client.ping(Bytes::from_static(b"jackbox")).await?;
             }
             _ = room.exit.notified() => {
                 break
@@ -713,7 +717,12 @@ async fn process_message(
                                                     .insert(&mut txn, 0, &s);
                                             }
 
+                                            let initial_snapshot = {
+                                                let txn = doc.transact();
+                                                txn.snapshot()
+                                            };
                                             JBPlayerValue::TextMap {
+                                                initial_snapshot,
                                                 root: Awareness::new(doc),
                                             }
                                         }
@@ -901,7 +910,7 @@ async fn process_message(
             let pc = client.pc.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if let Some(mut entity) = room.entities.get_mut(&params.key) {
                 if let JBValue::Player {
-                    val: JBPlayerValue::TextMap { ref mut root },
+                    val: JBPlayerValue::TextMap { ref mut root, .. },
                     ..
                 } = entity.value_mut().1.val
                 {
@@ -921,17 +930,21 @@ async fn process_message(
                             msg.wrap_err("text-map/sync encountered an invalid yjs message")?;
                         match msg {
                             yrs::sync::Message::Sync(m) => match m {
-                                SyncMessage::Update(u) => root.doc().transact_mut().apply_update(
-                                    Update::decode_v1(&u)
-                                        .wrap_err("Failed to decode yjs Update v1")?,
-                                ),
+                                SyncMessage::Update(u) => root
+                                    .doc()
+                                    .transact_mut()
+                                    .apply_update(
+                                        Update::decode_v1(&u)
+                                            .wrap_err("Failed to decode yjs Update v1")?,
+                                    )
+                                    .wrap_err("Failed to update text map")?,
                                 _ => {}
                             },
                             yrs::sync::Message::Awareness(a) => {
                                 root.apply_update(a)
                                     .wrap_err("Failed to apply awareness update to text-map")?;
                             }
-                            _ => {}
+                            m => tracing::warn!("Received unknown YRS message: `{:?}`", m),
                         }
                     }
 
@@ -971,7 +984,11 @@ async fn process_message(
         JBParams::TextMapGet { key, include_nodes } => {
             if let Some(entity) = room.entities.get(&key) {
                 if let JBValue::Player {
-                    val: JBPlayerValue::TextMap { ref root },
+                    val:
+                        JBPlayerValue::TextMap {
+                            ref root,
+                            ref initial_snapshot,
+                        },
                     ..
                 } = entity.value().1.val
                 {
@@ -990,24 +1007,26 @@ async fn process_message(
                                 let text = text_ref.diff_range(
                                     &mut txn,
                                     Some(&snapshot),
-                                    Some(&Snapshot::default()),
+                                    Some(initial_snapshot),
                                     YChange::identity,
                                 );
 
                                 Some(
                                     text.into_iter()
                                         .map(|diff| {
-                                            let yrs::Value::Any(yrs::Any::String(text)) =
-                                                diff.insert
+                                            let yrs::Out::Any(yrs::Any::String(text)) = diff.insert
                                             else {
                                                 panic!(
                                                     "yrs text-map contained \
                                                 data structure other than text"
                                                 )
                                             };
-                                            let ychange = diff.ychange.unwrap();
+                                            let author = diff
+                                                .ychange
+                                                .map(|change| change.id.client.get())
+                                                .unwrap_or(1);
                                             JBTextMapAttribution {
-                                                author: ychange.id.client,
+                                                author,
                                                 text,
                                                 pc: 0,
                                             }
@@ -1636,7 +1655,7 @@ pub async fn handle_socket_proxy(
                                                 .wrap_err("Failed to read from jq process")?;
                                             Ok(jm)
                                         } else {
-                                            Ok(m.to_owned())
+                                            Ok(m.to_string())
                                         }
                                 })
                                 .unwrap_or_else(|| Ok(String::new()))
@@ -1644,7 +1663,7 @@ pub async fn handle_socket_proxy(
                             },
                             "to ecast",
                         );
-                        return Ok(tokio_tungstenite::tungstenite::Message::Text(m));
+                        return Ok(tokio_tungstenite::tungstenite::Message::Text(m.to_string().into()));
                     }
                     axum::extract::ws::Message::Binary(m) => {
                         Ok(tokio_tungstenite::tungstenite::Message::Binary(m))
@@ -1659,7 +1678,7 @@ pub async fn handle_socket_proxy(
                         Ok(tokio_tungstenite::tungstenite::Message::Close(m.map(|f| {
                             tokio_tungstenite::tungstenite::protocol::CloseFrame {
                                 code: f.code.into(),
-                                reason: f.reason,
+                                reason: f.reason.to_string().into(),
                             }
                         })))
                     }
@@ -1701,7 +1720,7 @@ pub async fn handle_socket_proxy(
                                             .wrap_err("Failed to read from jq process")?;
                                         Ok(jm)
                                     } else {
-                                        Ok(m.to_owned())
+                                        Ok(m.to_string())
                                     }
                             })
                             .unwrap_or_else(|| Ok(String::new()))
@@ -1709,7 +1728,7 @@ pub async fn handle_socket_proxy(
                         },
                         "ecast to",
                     );
-                    return Ok(axum::extract::ws::Message::Text(m));
+                    return Ok(axum::extract::ws::Message::Text(m.to_string().into()));
                 }
                 tokio_tungstenite::tungstenite::Message::Binary(m) => {
                     Ok(axum::extract::ws::Message::Binary(m))
@@ -1724,7 +1743,7 @@ pub async fn handle_socket_proxy(
                     Ok(axum::extract::ws::Message::Close(m.map(|f| {
                         axum::extract::ws::CloseFrame {
                             code: f.code.into(),
-                            reason: f.reason,
+                            reason: f.reason.to_string().into(),
                         }
                     })))
                 }

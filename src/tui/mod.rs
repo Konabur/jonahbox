@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use axum_server::Address;
 use crossterm::{
     event::{self, KeyCode, KeyEvent, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -27,12 +28,12 @@ mod room_view;
 mod rooms_list;
 pub mod tracing_writer;
 
-struct TuiState {
+struct TuiState<A: Address> {
     log_scroll_state: Option<usize>,
     rooms_list_state: ListState,
     rooms_entity_list_state: ListState,
     log: Option<TuiWriter>,
-    axum_handle: axum_server::Handle,
+    axum_handle: axum_server::Handle<A>,
     state: crate::State,
     app_focus: AppFocus,
     room_tab: RoomTabs,
@@ -67,12 +68,12 @@ impl RoomTabs {
     }
 }
 
-impl TuiState {
-    fn rooms_list<'a>(&'a mut self) -> RoomsList<'a> {
+impl<A: Address> TuiState<A> {
+    fn rooms_list<'a>(&'a mut self) -> RoomsList<'a, A> {
         RoomsList(self)
     }
 
-    fn room_view<'a>(&'a mut self) -> RoomView<'a> {
+    fn room_view<'a>(&'a mut self) -> RoomView<'a, A> {
         RoomView(self)
     }
 
@@ -213,8 +214,8 @@ impl TuiState {
     }
 }
 
-pub async fn tui(
-    axum_handle: axum_server::Handle,
+pub async fn tui<A: Address>(
+    axum_handle: axum_server::Handle<A>,
     state: crate::State,
     log: Option<TuiWriter>,
     mut rx: Receiver<()>,
@@ -357,7 +358,7 @@ pub async fn tui(
     Ok(())
 }
 
-fn ui(frame: &mut Frame, tui_state: &mut TuiState) {
+fn ui<A: Address>(frame: &mut Frame, tui_state: &mut TuiState<A>) {
     let split_layout = Layout::new(
         ratatui::layout::Direction::Horizontal,
         [Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)],

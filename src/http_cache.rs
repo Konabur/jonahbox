@@ -1,32 +1,23 @@
-use std::io::{BufReader, BufWriter};
+use std::borrow::Cow;
+use std::io::{BufReader, BufWriter, Cursor};
 use std::ops::DerefMut;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use async_compression::brotli::EncoderParams;
 use async_compression::tokio::bufread::{BrotliDecoder, BrotliEncoder};
-use async_compression::tokio::write;
 use axum::http::uri::{Authority, Scheme};
 use axum::http::HeaderMap;
 use axum::http::{uri, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use color_eyre::eyre::{eyre, Context, OptionExt};
-use futures_util::TryStreamExt;
-use helix_core::syntax::RopeProvider;
-use helix_core::{Rope, RopeBuilder};
-use helix_lsp::lsp::TextEdit;
-use helix_stdx::rope::{Regex, RopeSliceExt};
-use regex_cursor::Input;
+use regex::{Captures, Regex};
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH};
 use reqwest::header::{CONTENT_TYPE, ETAG};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::{io::AsyncBufReadExt, sync::Mutex};
-use tokio_util::io::StreamReader;
 use tracing::instrument;
-use tree_sitter::QueryCursor;
 
 use crate::error::{PropogateRequest, WithStatusCode};
 use crate::CacheMode;
@@ -34,9 +25,6 @@ use crate::CacheMode;
 #[derive(Clone)]
 pub struct HttpCache {
     pub client: reqwest::Client,
-    pub ts_parser: Arc<Mutex<(tree_sitter::Parser, QueryCursor)>>,
-    pub js_lang: Arc<(tree_sitter::Language, tree_sitter::Query)>,
-    pub css_lang: Arc<(tree_sitter::Language, tree_sitter::Query)>,
     pub regexes: Arc<Regexes>,
 }
 
@@ -82,7 +70,7 @@ impl JBHttpResponse {
             compressed: value
                 .headers()
                 .get(CONTENT_TYPE)
-                .is_some_and(|ct| content_to_compress.is_match(Input::new(ct.as_bytes()))),
+                .is_some_and(|ct| content_to_compress.is_match(ct.to_str().unwrap_or_default())),
         })
     }
 
@@ -131,7 +119,7 @@ impl HttpCache {
             let path_split = path.split_once('@').unwrap().1;
             let path_split = path_split.split_once('/').unwrap_or((path_split, ""));
             let host = path_split.0;
-            if !self.regexes.jackbox_urls.is_match(Input::new(host)) {
+            if !self.regexes.jackbox_urls.is_match(host) {
                 return Err(eyre!("Proxy can only be used with Jackbox services"))
                     .with_status_code(StatusCode::BAD_REQUEST);
             }
@@ -178,6 +166,13 @@ impl HttpCache {
             .flatten()
             .flat_map(|e| e.split(','))
             .any(|s| s.trim() == "br");
+
+        match headers.entry(ACCEPT_ENCODING) {
+            reqwest::header::Entry::Occupied(e) => {
+                e.remove_entry_mult();
+            }
+            _ => {}
+        }
 
         let cached_resource_raw = cache_path.join(format!(
             "{}/{}",
@@ -341,268 +336,71 @@ impl HttpCache {
                 drop(part_file_w);
                 let _ = tokio::fs::remove_file(&part_path).await;
             } else {
-                match resp.content_type.as_ref().map(|ct| ct.as_ref()) {
-                    Some("text/javascript") | Some("application/json") => {
-                        let mut rope = rope_from_reader(StreamReader::new(
-                            reqwest_resp.unwrap().bytes_stream().map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::ConnectionReset, e)
-                            }),
-                        ))
+                let response = reqwest_resp
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .wrap_err_with(|| {
+                        format!("Failed to retreive bytes for URL with path: `{}`", uri)
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                let mut text = None;
+                let response: Cow<'_, [u8]> = if resp
+                    .headers()?
+                    .get(CONTENT_TYPE)
+                    .map(|c| {
+                        c == "text/html"
+                            || c == "text/javascript"
+                            || c == "application.json"
+                            || c == "text/css"
+                    })
+                    .unwrap_or_default()
+                {
+                    let text = text.get_or_insert(String::from_utf8_lossy(&response));
+                    let result = self
+                        .regexes
+                        .jackbox_urls
+                        .replace_all(text, |c: &Captures<'_>| {
+                            format!("{}/@{}", accessible_host, c.get_match().as_str())
+                        });
+                    match result {
+                        Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
+                        Cow::Owned(s) => Cow::Owned(s.into_bytes()),
+                    }
+                } else {
+                    Cow::Owned(response.into())
+                };
+                if resp.compressed {
+                    let mut stream = BrotliEncoder::with_quality(
+                        Cursor::new(response),
+                        async_compression::Level::Best,
+                    );
+
+                    let mut file = tokio::io::BufWriter::new(part_file_w.deref_mut());
+
+                    tokio::io::copy(&mut stream, &mut file)
                         .await
-                        .wrap_err("Failed to convert JavaScript response byte stream to Rope")
+                        .wrap_err("Failed to copy byte stream to a compressed brotli file")
                         .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                        let mut lock = self.ts_parser.lock().await;
-                        let (parser, query_cursor) = lock.deref_mut();
-
-                        parser
-                            .set_language(&self.js_lang.0)
-                            .wrap_err("Failed to initialize JavaScript parser")
-                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        let tree = parser
-                            .parse_with(
-                                &mut |byte, _| {
-                                    if byte <= rope.len_bytes() {
-                                        let (chunk, start_byte, _, _) = rope.chunk_at_byte(byte);
-                                        &chunk.as_bytes()[byte - start_byte..]
-                                    } else {
-                                        // out of range
-                                        &[]
-                                    }
-                                },
-                                None,
-                            )
-                            .ok_or_eyre("Failed to parse JavaScript resource")
-                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        let mut edits: Vec<TextEdit> = Vec::new();
-                        for query_match in query_cursor.matches(
-                            &self.js_lang.1,
-                            tree.root_node(),
-                            RopeProvider(rope.slice(..)),
-                        ) {
-                            let range = query_match.captures[0].node.byte_range();
-                            let slice = rope.byte_slice(range.clone());
-                            let range =
-                                rope.byte_to_char(range.start)..rope.byte_to_char(range.end);
-                            for regex_match in
-                                self.regexes.jackbox_urls.find_iter(slice.regex_input())
-                            {
-                                edits.push(TextEdit {
-                                    range: helix_lsp::util::range_to_lsp_range(
-                                        &rope,
-                                        helix_core::selection::Range {
-                                            anchor: range.start + regex_match.start(),
-                                            head: range.start + regex_match.start(),
-                                            // head: (range.start + regex_match.end()),
-                                            old_visual_position: None,
-                                        },
-                                        helix_lsp::OffsetEncoding::Utf8,
-                                    ),
-                                    new_text: format!("{}/@", accessible_host),
-                                });
-                            }
-                        }
-
-                        let transaction = helix_lsp::util::generate_transaction_from_edits(
-                            &rope,
-                            edits,
-                            helix_lsp::OffsetEncoding::Utf8,
-                        );
-
-                        if !transaction.apply(&mut rope) {
-                            return Err(eyre!("Failed to patch JavaScript file"))
-                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                        }
-
-                        if resp.compressed {
-                            let mut stream = write::BrotliEncoder::with_quality_and_params(
-                                tokio::io::BufWriter::new(part_file_w.deref_mut()),
-                                async_compression::Level::Best,
-                                EncoderParams::default().text_mode(),
-                            );
-
-                            for chunk in rope.chunks() {
-                                stream
-                                    .write_all(chunk.as_bytes())
-                                    .await
-                                    .wrap_err("Failed to write Rope chunk to brotli compressor")
-                                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                            }
-
-                            stream
-                                .shutdown()
-                                .await
-                                .wrap_err("Failed to shutdown brotli compression stream")
-                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                        } else {
-                            let mut stream = tokio::io::BufWriter::new(part_file_w.deref_mut());
-
-                            for chunk in rope.chunks() {
-                                stream
-                                    .write_all(chunk.as_bytes())
-                                    .await
-                                    .wrap_err("Failed to write Rope chunk to uncompressed stream")
-                                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                            }
-
-                            stream
-                                .shutdown()
-                                .await
-                                .wrap_err("Failed to shutdown uncompressed stream")
-                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                        }
-                    }
-                    Some("text/css") => {
-                        let mut rope = rope_from_reader(StreamReader::new(
-                            reqwest_resp.unwrap().bytes_stream().map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::ConnectionReset, e)
-                            }),
-                        ))
+                    file.shutdown()
                         .await
-                        .wrap_err("Failed to convert CSS response byte stream to Rope")
+                        .wrap_err("Failed to shutdown compressed brotli file stream")
+                        .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
+                } else {
+                    let mut stream = Cursor::new(response);
+                    let mut file = tokio::io::BufWriter::new(part_file_w.deref_mut());
+
+                    tokio::io::copy(&mut stream, &mut file)
+                        .await
+                        .wrap_err("Failed to copy byte stream to an uncompressed file")
                         .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                        let mut lock = self.ts_parser.lock().await;
-                        let (parser, query_cursor) = lock.deref_mut();
-
-                        parser
-                            .set_language(&self.css_lang.0)
-                            .wrap_err("Failed to initialize JavaScript parser")
-                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        let tree = parser
-                            .parse_with(
-                                &mut |byte, _| {
-                                    if byte <= rope.len_bytes() {
-                                        let (chunk, start_byte, _, _) = rope.chunk_at_byte(byte);
-                                        &chunk.as_bytes()[byte - start_byte..]
-                                    } else {
-                                        // out of range
-                                        &[]
-                                    }
-                                },
-                                None,
-                            )
-                            .ok_or_eyre("Failed to parse CSS resource")
-                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        let mut edits: Vec<TextEdit> = Vec::new();
-                        for query_match in query_cursor.matches(
-                            &self.css_lang.1,
-                            tree.root_node(),
-                            RopeProvider(rope.slice(..)),
-                        ) {
-                            let range = query_match.captures[0].node.byte_range();
-                            let slice = rope.byte_slice(range.clone());
-                            let range =
-                                rope.byte_to_char(range.start)..rope.byte_to_char(range.end);
-                            for regex_match in
-                                self.regexes.jackbox_urls.find_iter(slice.regex_input())
-                            {
-                                edits.push(TextEdit {
-                                    range: helix_lsp::util::range_to_lsp_range(
-                                        &rope,
-                                        helix_core::selection::Range {
-                                            anchor: range.start + regex_match.start(),
-                                            head: range.start + regex_match.start(),
-                                            // head: (range.start + regex_match.end()),
-                                            old_visual_position: None,
-                                        },
-                                        helix_lsp::OffsetEncoding::Utf8,
-                                    ),
-                                    new_text: format!("{}/@", accessible_host),
-                                });
-                            }
-                        }
-
-                        let transaction = helix_lsp::util::generate_transaction_from_edits(
-                            &rope,
-                            edits,
-                            helix_lsp::OffsetEncoding::Utf8,
-                        );
-
-                        if !transaction.apply(&mut rope) {
-                            return Err(eyre!("Failed to patch CSS file"))
-                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                        }
-
-                        if resp.compressed {
-                            let mut stream = write::BrotliEncoder::with_quality_and_params(
-                                tokio::io::BufWriter::new(part_file_w.deref_mut()),
-                                async_compression::Level::Best,
-                                EncoderParams::default().text_mode(),
-                            );
-
-                            for chunk in rope.chunks() {
-                                stream
-                                    .write_all(chunk.as_bytes())
-                                    .await
-                                    .wrap_err("Failed to write Rope chunk to brotli compressor")
-                                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                            }
-
-                            stream
-                                .shutdown()
-                                .await
-                                .wrap_err("Failed to shutdown brotli compression stream")
-                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                        } else {
-                            let mut stream = tokio::io::BufWriter::new(part_file_w.deref_mut());
-
-                            for chunk in rope.chunks() {
-                                stream
-                                    .write_all(chunk.as_bytes())
-                                    .await
-                                    .wrap_err("Failed to write Rope chunk to uncompressed stream")
-                                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                            }
-
-                            stream
-                                .shutdown()
-                                .await
-                                .wrap_err("Failed to shutdown uncompressed stream")
-                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                        }
-                    }
-                    _ if resp.compressed => {
-                        let mut stream = BrotliEncoder::with_quality(
-                            StreamReader::new(reqwest_resp.unwrap().bytes_stream().map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::ConnectionReset, e)
-                            })),
-                            async_compression::Level::Best,
-                        );
-
-                        let mut file = tokio::io::BufWriter::new(part_file_w.deref_mut());
-
-                        tokio::io::copy(&mut stream, &mut file)
-                            .await
-                            .wrap_err("Failed to copy byte stream to a compressed brotli file")
-                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        file.shutdown()
-                            .await
-                            .wrap_err("Failed to shutdown compressed brotli file stream")
-                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                    }
-                    _ => {
-                        let mut stream =
-                            StreamReader::new(reqwest_resp.unwrap().bytes_stream().map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::ConnectionReset, e)
-                            }));
-                        let mut file = tokio::io::BufWriter::new(part_file_w.deref_mut());
-
-                        tokio::io::copy(&mut stream, &mut file)
-                            .await
-                            .wrap_err("Failed to copy byte stream to an uncompressed file")
-                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        file.shutdown()
-                            .await
-                            .wrap_err("Failed to shutdown uncompressed file stream")
-                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
-                    }
+                    file.shutdown()
+                        .await
+                        .wrap_err("Failed to shutdown uncompressed file stream")
+                        .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
                 let cached_resource_raw_dir = cached_resource_raw
                     .parent()
@@ -762,69 +560,4 @@ impl HttpCache {
             return Ok(resp);
         }
     }
-}
-
-async fn rope_from_reader<T: tokio::io::AsyncBufRead>(reader: T) -> std::io::Result<Rope> {
-    tokio::pin!(reader);
-    let mut builder = RopeBuilder::new();
-    let mut off_char: Option<heapless::Vec<u8, 4>> = None;
-    let mut off_buff = Vec::new();
-    loop {
-        match (&mut reader).fill_buf().await {
-            Ok(buffer) => {
-                let buffer_len = buffer.len();
-                if buffer_len == 0 {
-                    break;
-                }
-
-                let buffer = if let Some(ref off_char) = off_char {
-                    off_buff.clear();
-                    off_buff.extend_from_slice(&off_char);
-                    off_buff.extend_from_slice(buffer);
-                    off_buff.as_slice()
-                } else {
-                    buffer
-                };
-
-                // Determine how much of the buffer is valid utf8.
-                let valid_count = match std::str::from_utf8(buffer) {
-                    Ok(_) => buffer.len(),
-                    Err(e) => e.valid_up_to(),
-                };
-
-                // Append the valid part of the buffer to the rope.
-                if valid_count > 0 {
-                    // The unsafe block here is reinterpreting the bytes as
-                    // utf8.  This is safe because the bytes being
-                    // reinterpreted have already been validated as utf8
-                    // just above.
-                    builder
-                        .append(unsafe { std::str::from_utf8_unchecked(&buffer[..valid_count]) });
-                    let invalid = &buffer[valid_count..];
-
-                    off_char = None;
-                    if !invalid.is_empty() {
-                        let mut buf = heapless::Vec::new();
-                        buf.extend_from_slice(invalid).unwrap();
-                        off_char = Some(buf);
-                    }
-                } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "stream did not contain valid UTF-8",
-                    ));
-                }
-
-                // Shift the un-read part of the buffer to the beginning.
-                (&mut reader).consume(buffer_len);
-            }
-
-            Err(e) => {
-                // Read error
-                return Err(e);
-            }
-        }
-    }
-
-    return Ok(builder.finish());
 }
