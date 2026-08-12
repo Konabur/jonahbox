@@ -43,6 +43,7 @@ yrs = { version = "0.26.0", features = ["sync"] }
 base64 = "0.22.1"
 regex = "1.12.3"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+rustls = { version = "0.23", features = ["ring"] }
 
 [profile.dev.package."*"]
 opt-level = 3

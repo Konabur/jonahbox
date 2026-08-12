@@ -405,6 +405,7 @@ pub struct ConnectedSocket {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     color_eyre::install()?;
 
     let config_file =
