@@ -10,7 +10,7 @@ axum = { version = "0.8.9", features = ["ws", "macros"] }
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
 futures-util = "0.3.30"
 rand = { version = "0.8.5", default-features = false, features = ["std", "getrandom"] }
-reqwest = { version = "0.12.4", features = ["json", "brotli"] }
+reqwest = { version = "0.12.4", default-features = false, features = ["json", "brotli", "rustls-tls"] }
 serde = { version = "1.0.202", features = ["derive"] }
 serde_json = "1.0.117"
 serde_urlencoded = "0.7.1"
