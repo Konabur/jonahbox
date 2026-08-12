@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::io::{BufReader, BufWriter, Cursor};
 use std::ops::DerefMut;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -501,7 +500,7 @@ impl HttpCache {
                         )
                     })
                     .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
-                    .size() as usize,
+                    .len() as usize,
             );
             let mut resp = if resp.compressed {
                 (status_code, resp_headers, {

@@ -61,6 +61,7 @@ impl Default for Acl {
 
 impl Display for Acl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if self.interest.is_priority() {
             write!(f, "s")?;
         }
@@ -109,9 +110,13 @@ impl FromStr for Acl {
             .0
             .chars()
             .try_fold(None, |state, interest| match interest {
-                's' => Ok(Some(
-                    state.unwrap_or(Interest::PRIORITY) | Interest::PRIORITY,
-                )),
+                's' => {
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    let next = state.unwrap_or(Interest::READABLE) | Interest::PRIORITY;
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let next = state.unwrap_or(Interest::READABLE);
+                    Ok(Some(next))
+                }
                 'r' => Ok(Some(
                     state.unwrap_or(Interest::READABLE) | Interest::READABLE,
                 )),
