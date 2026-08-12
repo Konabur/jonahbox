@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-20.04, ubuntu-24.04-arm, macos-latest, windows-latest]
+        os: [ubuntu-24.04-arm, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -40,9 +40,66 @@ jobs:
           name: jonahbox-${{ matrix.os }}
           path: dist/
 
+  linux-glibc:
+    name: build-linux-glibc
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    timeout-minutes: 7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --release
+
+      - name: collect binary
+        run: |
+          mkdir -p dist
+          cp target/release/jonahbox dist/jonahbox-linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jonahbox-linux-glibc
+          path: dist/
+
+  musl:
+    name: build-linux-musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: collect binary
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/jonahbox dist/jonahbox-linux-musl-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jonahbox-linux-musl
+          path: dist/
+
   release:
     name: publish
-    needs: build
+    needs: [build, linux-glibc, musl]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
