@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     fmt::{Debug, Display, LowerHex},
     io::stdout,
-    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::DerefMut,
     path::PathBuf,
     sync::{
@@ -509,16 +509,11 @@ async fn main() -> eyre::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, ports.https, 0, 0));
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, ports.https));
     tracing::info!("Ecast listening on {}", addr);
-    let blobcast_addr = SocketAddr::V6(SocketAddrV6::new(
-        Ipv6Addr::UNSPECIFIED,
-        ports.blobcast,
-        0,
-        0,
-    ));
+    let blobcast_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, ports.blobcast));
     tracing::info!("Blobcast listening on {}", blobcast_addr);
-    let http_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, ports.http, 0, 0));
+    let http_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, ports.http));
     tracing::info!("Ecast (insecure) listening on {}", http_addr);
     tokio::try_join!(
         axum_server::bind_rustls(addr, tls_config.clone())
