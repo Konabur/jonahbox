@@ -222,10 +222,14 @@ impl HttpCache {
             .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
         };
 
+        let safe_etag = resp
+            .etag
+            .replace(['<', '>', ':', '"', '/', '\\', '|', '?', '*'], "_");
+
         let mut cached_resource = if resp.compressed {
-            cache_path.join(format!("{}/{}.br", uri.host().unwrap(), resp.etag))
+            cache_path.join(format!("{}/{}.br", uri.host().unwrap(), safe_etag))
         } else {
-            cache_path.join(format!("{}/{}", uri.host().unwrap(), resp.etag))
+            cache_path.join(format!("{}/{}", uri.host().unwrap(), safe_etag))
         };
 
         let part_path = cached_resource.with_extension("part.br");
